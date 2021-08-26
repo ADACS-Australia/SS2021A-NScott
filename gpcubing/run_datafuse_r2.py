@@ -55,20 +55,20 @@ from sami.gpcubing import datafuse_r2 as df
 from sami.gpcubing import gpcovariance_log as gpcov
 import matplotlib.pylab as plt
 import scipy
-
 #################################
 """
 Specify parameters below for cubing:
 """
 
-def new_cube(fitslist,name,ccdband='blue',Lpix=50,pixscale=0.5,wavebin=1,responsebin=32,
+def new_cube(fitslist,name,ccdband='blue',Lpix=50,pixscale=0.5,wavebin=1,responsebin=32,nprocesses=4,
         path_out='/import/opus1/nscott/SAMI_Survey/new_cubes_output/',filename_ext='_50pix_05arcsec',
-        write_fits=True,gamma2psf=0.4,logtrans=True,write_covar=False,model_type='GP'):
+        parallel=True, write_fits=True,gamma2psf=0.4,logtrans=True,write_covar=False,model_type='GP'):
 
     # Lpix: number of pixels for x and y in final cube
     # pixscale: preferred 18/60 = 0.3
     # wavebin: number of wavelengths to stack in each bin
     # responsebin: interval in wavelengths to re-calculate response matrix (same for storing response matrix)
+    # nprocesses: number of processes used in multiprocessing slices
     # ccdband: choose 'red 'or 'blue'
     # star_only: run only on star image for testing, specify identifier of star below
 
@@ -114,8 +114,9 @@ def new_cube(fitslist,name,ccdband='blue',Lpix=50,pixscale=0.5,wavebin=1,respons
                                 gamma2psf=gamma2psf, logtrans=logtrans,model_type=model_type)
 
         ######## Return reconstructed cubes (covar_cube is zero if not explicitly called, see above):
-        data_cube, var_cube, resp_cube, covar_cube = fuse.fusecube(Lpix = Lpix, 
-                    binsize=wavebin, nresponse = responsebin, marginalize=marginalize)
+        data_cube, var_cube, resp_cube, covar_cube = fuse.fusecube(Lpix=Lpix,
+                    binsize=wavebin, nresponse=responsebin, nprocesses=nprocesses,
+                    parallel=parallel, marginalize=marginalize)
 
         ######## Write fits files for data+variance cube and one fits file for components to reconstruct covaraince :
         if write_fits:
@@ -129,8 +130,6 @@ def new_cube(fitslist,name,ccdband='blue',Lpix=50,pixscale=0.5,wavebin=1,respons
                                     fuse.gpoffset, pixscale, Lpix, gpmethod, marginalize, 
                                     path_out = path_out, filename_out = filename_out_covar, 
                                     overwrite = True, _Nexp = _Nexp)
-
-
 
     print('CUBING FINISHED')
     print('-----------------------------------------')

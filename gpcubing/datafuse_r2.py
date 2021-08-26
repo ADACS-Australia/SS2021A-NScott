@@ -21,6 +21,9 @@ import astropy.wcs as pw
 from astropy.modeling import models as astromodels
 from astropy.modeling import fitting as astrofitting
 from glob import glob
+from multiprocessing import Pool
+from multiprocessing import sharedctypes
+from functools import partial
 # Sami specific modules:
 import sami.utils as utils
 from sami.general import wcs as wcs
@@ -889,9 +892,8 @@ class DataFuse3D():
         else:
             print("Marginalizing over hyperparameter gamma")
 
-
-    def fuseimage(self, wavenumber, wavenumber2 = None, Lpix = 50, plot = False,
-                  show = False, covar = False, nresponse = 32, marginalize = False):
+    def fuseimage(self, wavenumber, wavenumber2=None, Lpix=50, plot=False,
+                  show=False, covar=False, nresponse=32, parallel=True, marginalize=False):
         """Function for transformation of fiber to image 
         : param wavenumber: spectral axis number, or lower end for binnning if wavenumber2 > 1
         : param wavenumber: upper end of spectral axis for binning, if None. no binning over data
@@ -903,6 +905,7 @@ class DataFuse3D():
                     Default method is to store only matrix components to reconstruct covariance matrix later.
         : param nresponse: number of steps along spectral axis to repeat calculation of response matrix; 
              nresponse should be a number = 2^n (2^n <= spectral axis), Default = 32
+        : param parallel: process slice parallelly if True, otherwise process serially
         : param marginalize: if True, marginalize gamma and scale factor out of posterior cube prediction
         """
         if wavenumber2 is not None:
@@ -928,27 +931,47 @@ class DataFuse3D():
         # Calculate response matrix only every nresponse step:
         kl_approx = False
         if self.model_type == 'GP':
-            if (wavenumber % nresponse == 0) or (hasattr(self,'response') == False):
-                self.response = cs.ResponseMatrix(coord, dar_cor, cs.moffat_psf,
+            if not parallel:
+                if (wavenumber % nresponse == 0) or (hasattr(self, 'response') == False):
+                    self.response = cs.ResponseMatrix(coord, dar_cor, cs.moffat_psf,
+                                                      Lpix, self.pixscale, fft=True,
+                                                      avgpsf=self.avgpsf, _Nexp=self._Nexp)
+                    model = cs.GPModel(self.response, fibflux, fibfluxerr,
+                                       calcresponse=True, gpmethod=self.gpmethod,
+                                       logtrans=self.logtrans)
+                else:
+                    model = cs.GPModel(self.response, fibflux, fibfluxerr, calcresponse=False,
+                                       gpmethod=self.gpmethod, logtrans=self.logtrans)
+                    model._A = self.resp0
+                    model._K_gv = self.K0
+                    model._AK_gv = self.AK0
+                    model._AKA_gv = self.AKA0
+
+            else:
+                # JH 2021/08: in the current implementation, if processing slices
+                # parallelly, the response matrix would be calculated for each slice
+                response = cs.ResponseMatrix(coord, dar_cor, cs.moffat_psf,
                                                 Lpix, self.pixscale, fft=True,
                                                 avgpsf=self.avgpsf,_Nexp = self._Nexp)
-                model = cs.GPModel(self.response, fibflux, fibfluxerr, 
+                model = cs.GPModel(response, fibflux, fibfluxerr,
                                     calcresponse = True, gpmethod = self.gpmethod,
                                      logtrans = self.logtrans)
-            else: 
-                model = cs.GPModel(self.response, fibflux, fibfluxerr, calcresponse = False, 
-                                    gpmethod = self.gpmethod, logtrans = self.logtrans)
-                model._A = self.resp0
-                model._K_gv = self.K0
-                model._AK_gv = self.AK0
-                model._AKA_gv = self.AKA0
         
         elif self.model_type == 'CRR':
-                if (wavenumber % nresponse == 0) or (hasattr(self,'response') == False):
+            if not parallel:
+                if (wavenumber % nresponse == 0) or (hasattr(self, 'response') == False):
                     self.response = cs.ResponseMatrix(coord, dar_cor, cs.moffat_psf,
-                                                Lpix, self.pixscale, fft=True,
-                                                avgpsf=self.avgpsf,_Nexp = self._Nexp)
-                model = cs.CRRModel(self.response,fibflux,fibfluxerr)
+                                                      Lpix, self.pixscale, fft=True,
+                                                      avgpsf=self.avgpsf, _Nexp=self._Nexp)
+                model = cs.CRRModel(self.response, fibflux, fibfluxerr)
+
+            else:
+                # JH 2021/08: in the current implementation, if processing slices
+                # parallelly, the response matrix would be calculated for each slice
+                response = cs.ResponseMatrix(coord, dar_cor, cs.moffat_psf,
+                                            Lpix, self.pixscale, fft=True,
+                                            avgpsf=self.avgpsf,_Nexp = self._Nexp)
+                model = cs.CRRModel(response,fibflux,fibfluxerr)
             
         
         else:
@@ -994,15 +1017,60 @@ class DataFuse3D():
 
         return model.scene, model.variance, model._A, model.covariance, model._K_gv, model._AK_gv, model._AKA_gv, model.yvar_log
 
-    
-    def fusecube(self, Lpix = 50, binsize = 1, nresponse = 32,  silent = True, marginalize=True):
+    def process_single_slice(self, l, Lpix, binsize, nresponse, marginalize, parallel=True):
+        """ Process a single wavelength slice
+        : param Lpix: Number of pixels in x/y direction
+        : param binsize: number of wavelength slices to combine in one bin;
+                        must be a number of 2^n.  Default = 2.
+        : param nresponse: number of steps along spectral axis to repeat calculation of response matrix;
+             nresponse should be a number = 2^n (2^n <= spectral axis), Default = 32
+        : param parallel: process slice parallelly if True, otherwise process serially
+        : param marginalize: if True, marginalize gamma and scale factor out of posterior cube prediction
+        """
+
+        print("wavelength slide:", self.wlow_vec[l], ' - ', self.wup_vec[l])
+
+        # JH 2021/07: create numpy arrays from ctypes objects with shared memory for cube matrices
+        flux_cube = np.ctypeslib.as_array(shared_array_fc)
+        var_cube = np.ctypeslib.as_array(shared_array_vc)
+        resp_cube = np.ctypeslib.as_array(shared_array_rc)
+
+        if binsize > 1:
+            data_l, var_l, resp_l, covar_l, K_l, AK_l, AKA_l, logvar_l = self.fuseimage(self.wlow_vec[l],
+                                                                                        wavenumber2=self.wup_vec[l],
+                                                                                        Lpix=Lpix, plot=False,
+                                                                                        covar=False,
+                                                                                        nresponse=nresponse,
+                                                                                        parallel=parallel,
+                                                                                        marginalize=marginalize)
+        elif binsize == 1:
+            data_l, var_l, resp_l, covar_l, K_l, AK_l, AKA_l, logvar_l = self.fuseimage(self.wlow_vec[l], Lpix=Lpix,
+                                                                                        plot=False,
+                                                                                        covar=False,
+                                                                                        nresponse=nresponse,
+                                                                                        parallel=parallel,
+                                                                                        marginalize=marginalize)
+        flux_cube[:, :, l] = data_l
+        var_cube[:, :, l] = var_l
+        self.logvar_fibre[:, l] = logvar_l
+        if self.gcovar:
+            # JH 2021/07: create numpy array of covar cube from ctypes array with shared memory
+            covar_cube = np.ctypeslib.as_array(shared_array_cc)
+            covar_cube[:, :, l] = covar_l  # imshift(var_l, (xdar_l,ydar_l), order=1)
+
+        self.fwhm_seeing[l] = np.nanmean(self.gamma[self.wlow_vec[l]:self.wup_vec[l]]) * 1 / self.gamma2psf
+
+    def fusecube(self, Lpix = 50, binsize = 1, nresponse = 32, nprocesses=4, parallel=True, silent = True, marginalize=True):
         """ Build cube by looping over all wavelength slides
         : param Lpix: Number of pixels in x/y direction
         : param binsize: number of wavelength slices to combine in one bin; 
                         must be a number of 2^n.  Default = 2.  
         : param nresponse: number of steps along spectral axis to repeat calculation of response matrix; 
              nresponse should be a number = 2^n (2^n <= spectral axis), Default = 32
+        : param nprocesses: number of processed used in multiprocessing slices, Default = 4
+        : param parallel: process slice parallelly if True, otherwise process serially
         : param silent: if True, print out each number of spectral slice or spectral bin processed, default = False
+        : param marginalize: if True, marginalize gamma and scale factor out of posterior cube prediction
         """
         if self.data.shape[2] % binsize != 0:
             print("Warning: Ratio of Wavelength Size by Binsize not Integer. Default to binsize = 1!")
@@ -1024,11 +1092,18 @@ class DataFuse3D():
         var_cube=np.zeros((Lpix, Lpix, Nbins)) * np.nan
 
         resp_cube=np.zeros((self._Nexp * _Nfib, Lpix*Lpix, int(Nbins * binsize/nresponse))) * np.nan
+
         self.logvar_fibre = np.zeros((self._Nexp * _Nfib, Nbins)) * np.nan
         if self.gcovar:
             covar_cube = np.zeros((Lpix**2, Lpix**2, Nbins)) * np.nan
+            # JH 2021/07: create shared ctypes object from covar cube numpy arrays
+            covar_cube = np.ctypeslib.as_ctypes(covar_cube)
+            global shared_array_cc
+            shared_array_cc = sharedctypes.RawArray(covar_cube._type_, covar_cube)
+
         else:
             covar_cube = 0.
+
         self.wlow_vec = np.linspace(0, Nbins-1, Nbins, dtype=int) * binsize
         self.wup_vec = np.linspace(1, Nbins, Nbins, dtype=int) * binsize
         
@@ -1054,39 +1129,75 @@ class DataFuse3D():
         # replace evtl loop with map function and enable multiprocessing option
         # map(self.fuseimage, range(Nbins))
         #print("Looping over wavelength range...")
-        
-        for l in range(Nbins):
-        #for l in range(200,240):
-            print("wavelength slide:", self.wlow_vec[l], ' - ', self.wup_vec[l])
-            if binsize > 1:
-                data_l, var_l, resp_l, covar_l, K_l, AK_l, AKA_l, logvar_l = self.fuseimage(self.wlow_vec[l], wavenumber2 = self.wup_vec[l], 
-                                                                                  Lpix = Lpix, plot = False, covar = False, 
-                                                                                  nresponse = nresponse, marginalize=marginalize)
-            elif binsize == 1:
-                data_l, var_l, resp_l, covar_l, K_l, AK_l, AKA_l, logvar_l = self.fuseimage(self.wlow_vec[l], Lpix = Lpix, plot = False, 
-                                                                                  covar = False, nresponse = nresponse, marginalize=marginalize)
-            ### optionally shift image in cube for additonal correction, comment out:
-            #xdar_l = (self.coord[0, :, :, self.wlow_vec[l]:self.wup_vec[l]].mean() - self.RA_cen) / self.pixscale
-            #ydar_l = (self.coord[1, :, :, self.wlow_vec[l]:self.wup_vec[l]].mean() - self.DEC_cen) / self.pixscale
-            #flux_cube[:, :, l] = imshift(data_l, (xdar_l,ydar_l), order=1)
-            #var_cube[:, :, l] = imshift(var_l, (xdar_l,ydar_l), order=1)
-            # or uncomment for no additional correction:
-            flux_cube[:, :, l] = data_l 
-            var_cube[:, :, l] = var_l 
-            self.logvar_fibre[:, l] = logvar_l
-            if (l * binsize % nresponse == 0) or (hasattr(self,'resp0') == False):
-                resp_cube[:,:,int(l*binsize/nresponse)] = resp_l
-                self.resp0 = resp_l # use repsone matrix for runs till next interval
-                self.K0 = K_l
-                self.AK0 = AK_l
-                self.AKA0 = AKA_l
-            if self.gcovar:
-                covar_cube[:,:,l] =  covar_l #imshift(var_l, (xdar_l,ydar_l), order=1)
+        if not parallel:
+            # for l in range(Nbins):
+            for l in range(200, 240):
+                print("wavelength slide:", self.wlow_vec[l], ' - ', self.wup_vec[l])
+                if binsize > 1:
+                    data_l, var_l, resp_l, covar_l, K_l, AK_l, AKA_l, logvar_l = self.fuseimage(self.wlow_vec[l],
+                                                                                                wavenumber2=
+                                                                                                self.wup_vec[l],
+                                                                                                Lpix=Lpix, plot=False,
+                                                                                                covar=False,
+                                                                                                nresponse=nresponse,
+                                                                                                parallel=parallel,
+                                                                                                marginalize=marginalize)
+                elif binsize == 1:
+                    data_l, var_l, resp_l, covar_l, K_l, AK_l, AKA_l, logvar_l = self.fuseimage(self.wlow_vec[l],
+                                                                                                Lpix=Lpix, plot=False,
+                                                                                                covar=False,
+                                                                                                nresponse=nresponse,
+                                                                                                parallel=parallel,
+                                                                                                marginalize=marginalize)
+                ### optionally shift image in cube for additonal correction, comment out:
+                # xdar_l = (self.coord[0, :, :, self.wlow_vec[l]:self.wup_vec[l]].mean() - self.RA_cen) / self.pixscale
+                # ydar_l = (self.coord[1, :, :, self.wlow_vec[l]:self.wup_vec[l]].mean() - self.DEC_cen) / self.pixscale
+                # flux_cube[:, :, l] = imshift(data_l, (xdar_l,ydar_l), order=1)
+                # var_cube[:, :, l] = imshift(var_l, (xdar_l,ydar_l), order=1)
+                # or uncomment for no additional correction:
+                flux_cube[:, :, l] = data_l
+                var_cube[:, :, l] = var_l
+                self.logvar_fibre[:, l] = logvar_l
+                if (l * binsize % nresponse == 0) or (hasattr(self, 'resp0') == False):
+                    resp_cube[:, :, int(l * binsize / nresponse)] = resp_l
+                    self.resp0 = resp_l  # use repsone matrix for runs till next interval
+                    self.K0 = K_l
+                    self.AK0 = AK_l
+                    self.AKA0 = AKA_l
+                if self.gcovar:
+                    covar_cube[:, :, l] = covar_l  # imshift(var_l, (xdar_l,ydar_l), order=1)
 
-            self.fwhm_seeing[l] = np.nanmean(self.gamma[self.wlow_vec[l]:self.wup_vec[l]]) * 1/self.gamma2psf
+                self.fwhm_seeing[l] = np.nanmean(self.gamma[self.wlow_vec[l]:self.wup_vec[l]]) * 1 / self.gamma2psf
+
+            # Optional: Accept data values with at least signal-to-noise ratio of >=1, otherwi
+
+        else:
+            # JH 2021/07: create shared ctypes object from cube numpy arrays
+            flux_cube = np.ctypeslib.as_ctypes(flux_cube)
+            global shared_array_fc
+            shared_array_fc = sharedctypes.RawArray(flux_cube._type_, flux_cube)
+            var_cube = np.ctypeslib.as_ctypes(var_cube)
+            global shared_array_vc
+            shared_array_vc = sharedctypes.RawArray(var_cube._type_, var_cube)
+            resp_cube = np.ctypeslib.as_ctypes(resp_cube)
+            global shared_array_rc
+            shared_array_rc = sharedctypes.RawArray(resp_cube._type_, resp_cube)
+
+            # JH 2021/07: start parallel process
+            p = Pool(processes=nprocesses)
+            print("start pooling")
+            p.map(partial(self.process_single_slice, Lpix=Lpix, binsize=binsize, nresponse=nresponse,
+                          parallel=parallel, marginalize=marginalize), list(range(200,240)), chunksize=10)
+            print("finish pooling")
+
+            # JH 2021/07: create numpy arrays from ctypes objects with shared memory for cube matrices
+            flux_cube = np.ctypeslib.as_array(shared_array_fc)
+            var_cube = np.ctypeslib.as_array(shared_array_vc)
+            resp_cube = np.ctypeslib.as_array(shared_array_rc)
 
 
-        # Optional: Accept data values with at least signal-to-noise ratio of >=1, otherwise set to zero
+
+        # Oresult = np.ctypeslib.as_array(shared_array)ptional: Accept data values with at least signal-to-noise ratio of >=1, otherwise set to zero
         # flux_cube[flux_cube/np.sqrt(var_cube) < 1.] = 0.
         # Exlude range outside fiber fundle: size = 14.7 arces = 15.22arcsec/mm
         # Set values outside of FoV radius to NaN:

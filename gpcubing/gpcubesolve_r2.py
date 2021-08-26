@@ -5,6 +5,7 @@ from __future__ import print_function, division
 import sys
 import time
 import numpy as np
+from numpy import newaxis
 import matplotlib.pyplot as plt
 from scipy import fftpack, interpolate, linalg, signal, optimize
 from scipy.special import erf
@@ -814,40 +815,51 @@ class CRRModel(SliceView):
         y, yerr = self.fibflux, self.fibfluxerr
         psf_pars, _ = hp[:-1], hp[-1]
         A = self.response(*psf_pars)
+
         Nfib, Npix = A.shape
         Lambda = 1e-3
         # Form the weights through SVD and apply
-        N = np.diag(yerr**2)
-        Nmsqrt = np.diag(1.0/yerr)
-        U, s, VT = linalg.svd(np.dot(Nmsqrt, A))
+
+        # JH 2021/05/13: Use numpy broadcast instead of creating diag
+        N = yerr**2
+        Nmsqrt = 1.0/yerr
+        NA = Nmsqrt[:, newaxis]*A
+        U, s, VT = linalg.svd(NA)
+
         s_ext = np.concatenate([s, np.zeros(Npix-Nfib)])
-        Sigma = np.diag(s_ext)
-        Sigma_Linv = np.zeros(A.shape)
-        Sigma_Linv[:Nfib,:Nfib] = np.diag(s / (s**2 + Lambda**2))
-        Q = np.dot(VT.T, np.dot(Sigma, VT))
+
+        # JH 2021/05/13: Use numpy broadcast instead of creating diag
+        Q = np.dot(s_ext*VT.T, VT)
         R = Q / Q.sum(axis=1)[:,None]
+        Linv = s / (s ** 2 + Lambda ** 2)
+
         # RS 2021/05/04:  Fixed missing factor of N ** -0.5 = np.diag(1/yerr).
         # This isn't the most efficient code since N is diagonal, but it does
         # at least now map directly to Liu+ 2019, Eqn 21.
-        W = np.dot(R, np.dot(VT.T, np.dot(Sigma_Linv.T, np.dot(U.T, Nmsqrt))))
-        
+
+        # JH 2021/05/13: Use numpy broadcast instead of creating diag
+        CH1 = np.zeros((A.shape[1], A.shape[0]))
+        CH1[:Nfib,:Nfib] = Linv[:, newaxis]*(Nmsqrt*U.T)
+        W = np.dot(R, np.dot(VT.T, CH1))
+
         # RS 2021/05/04:  Form solutions (Liu+ 2019, Eqns 22 and 24)
         result = np.dot(W, y).reshape(self.Lpix, self.Lpix)
-        covar = np.dot(np.dot(W, N), W.T)
+
+        # JH 2021/05/13: Use numpy broadcast instead of creating diag
+        covar = np.dot(N*W, W.T)
         var = np.diagonal(covar)
-        
+
         self._K_gv, self._AK_gv, self._AKA_gv = [ ], [ ], [ ] #just fillers
-        self._A = self.response(*psf_pars)
+        self._A = A
         self.yvar_log = np.log(yerr)
-        
-        self.scene_covar = covar        
+        self.scene_covar = covar
         self.pack_scene(result.ravel())
         self.pack_scene_var(var)
         
         return result
         
     def predict(self, gcovar=False):
-        
+
         if gcovar:
             self.pack_scene_covar(covar)
         
